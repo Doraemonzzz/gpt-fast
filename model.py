@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
+from xopes.ops import parallel_gumbel_multinomial_triton
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -133,7 +134,7 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
-    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, use_flash=False, is_prefill=False) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
@@ -142,8 +143,20 @@ class Transformer(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
         x = self.norm(x)
-        logits = self.output(x)
-        return logits
+        
+        if use_flash:
+            if self.use_tp:
+                output = self.output(x, use_flash=use_flash, is_prefill=is_prefill)
+            else:
+                if is_prefill:
+                    x = x[:, -1:]
+                output, lse = parallel_gumbel_multinomial_triton(x, self.output.weight.transpose(0, 1))
+                
+                return output
+        else:
+            output = self.output(x)
+        
+        return output
 
     @classmethod
     def from_name(cls, name: str):

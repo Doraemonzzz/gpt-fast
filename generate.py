@@ -26,7 +26,7 @@ torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 # Experimental features to reduce compilation times, will be on by default in future
 torch._inductor.config.fx_graph_cache = True 
-torch._functorch.config.enable_autograd_cache = True
+# torch._functorch.config.enable_autograd_cache = True
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -51,21 +51,33 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     probs = torch.nn.functional.softmax(logits, dim=-1)
     return probs
 
-def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
+def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None, **kwargs):
     probs = logits_to_probs(logits[:, -1], temperature, top_k)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
+    use_flash = sampling_kwargs.get("use_flash", False)
     # input_pos: [B, S]
-    logits = model(x, input_pos)
-    return sample(logits, **sampling_kwargs)[0]
+    if use_flash:
+        idx_next = model(x, input_pos, use_flash=True, is_prefill=True)
+        return idx_next
+    else:
+        logits = model(x, input_pos)
+        return sample(logits, **sampling_kwargs)[0]
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+    use_flash = sampling_kwargs.get("use_flash", False)
     # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
-    logits = model(x, input_pos)
-    return sample(logits, **sampling_kwargs)
+    if use_flash:
+        idx_next = model(x, input_pos, use_flash=True, is_prefill=False)
+        probs = torch.tensor(0.0).cuda()
+        
+        return idx_next, probs
+    else:
+        logits = model(x, input_pos)
+        return sample(logits, **sampling_kwargs)
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
@@ -216,7 +228,7 @@ def encode_tokens(tokenizer, string, bos=True, device=default_device):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp):
+def _load_model(checkpoint_path, device, precision, use_tp, parallel_lm_head):
     use_cuda = 'cuda' in device
     with torch.device('meta'):
         model = Transformer.from_name(checkpoint_path.parent.name)
@@ -239,11 +251,12 @@ def _load_model(checkpoint_path, device, precision, use_tp):
     if "model" in checkpoint and "stories" in str(checkpoint_path):
         checkpoint = checkpoint["model"]
     model.load_state_dict(checkpoint, assign=True)
+    model.use_tp = False
 
     if use_tp:
         from tp import apply_tp
         print("Applying tensor parallel to model ...")
-        apply_tp(model)
+        apply_tp(model, parallel_lm_head)
 
     model = model.to(device=device, dtype=precision)
     return model.eval()
@@ -284,6 +297,8 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    use_flash: bool = False,
+    parallel_lm_head: bool = False,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -300,7 +315,7 @@ def main(
         if rank != 0:
             # only print on rank 0
             print = lambda *args, **kwargs: None
-
+    print(f"Use tp: {use_tp}, use flash: {use_flash}, parallel lm head: {parallel_lm_head}")
     print(f"Using device={device}")
     precision = torch.bfloat16
     is_speculative = draft_checkpoint_path is not None
@@ -308,7 +323,7 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, use_tp)
+    model = _load_model(checkpoint_path, device, precision, use_tp, parallel_lm_head)
 
     if is_speculative:
         draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
@@ -395,6 +410,7 @@ def main(
                 callback=callback,
                 temperature=temperature,
                 top_k=top_k,
+                use_flash=use_flash,
             )
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
@@ -452,7 +468,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size to benchmark with')
-    parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
+    parser.add_argument('--top_k', type=int, default=None, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
@@ -461,10 +477,12 @@ if __name__ == '__main__':
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
+    parser.add_argument('--use_flash', action='store_true', help='Whether to use flash sample algorithm.')
+    parser.add_argument('--parallel_lm_head', action='store_true', help='Whether to parallel lm head.')
 
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.speculate_k, args.device, args.use_flash, args.parallel_lm_head
     )

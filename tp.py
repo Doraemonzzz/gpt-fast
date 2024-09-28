@@ -8,6 +8,7 @@ from typing import List, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 if os.uname().sysname != "Darwin":
     from torch.distributed import _functional_collectives as funcol
@@ -18,6 +19,7 @@ else:
 from model import Attention, FeedForward, Transformer
 from quantize import WeightOnlyInt4Linear
 
+from xopes.ops import parallel_gumbel_multinomial_triton, gumbel_multinomial_reduce_triton
 
 def _get_rank() -> int:
     return int(os.environ.get("LOCAL_RANK", "0"))
@@ -107,7 +109,7 @@ def _apply_tp_linear(linear: nn.Linear, style: str, weight_splits: List[int] = [
     # assert linear.weight.shape == (linear.out_features, linear.in_features)
 
 
-def _apply_tp_ffn(mlp: FeedForward) -> None:
+def _apply_tp_ffn(mlp: nn.Linear) -> None:
     assert hasattr(mlp, "w1")
     assert hasattr(mlp, "w3")
     assert hasattr(mlp, "w2")
@@ -139,18 +141,118 @@ def _apply_tp_attn(attn: Attention) -> None:
     attn.register_forward_hook(lambda _module, _input, output: funcol.all_reduce(
         output[0], "sum", list(range(world_size))))
 
+def _apply_tp_lm_head(out: nn.Linear, parallel_lm_head=False) -> None:
+    rank = _get_rank()
+    world_size = _get_world_size()
+    tgt = world_size - 1
+    
+    class ColumnParallelLinear(torch.nn.Module):
+        def __init__(
+            self,
+            weight,
+        ):
+            super().__init__()
+            
+            def shard(x, dim):
+                assert x.size(dim=dim) % world_size == 0
+                return torch.tensor_split(x, world_size, dim=dim)[rank]
+            
+            if parallel_lm_head:
+                sharded_weight = shard(weight, 0)
+                self.weight = nn.Parameter(sharded_weight, requires_grad=False)
+            else:
+                self.weight = nn.Parameter(weight, requires_grad=False)
+                
+            self.in_features = self.weight.shape[1]
+            self.out_features = self.weight.shape[0]
+            self.parallel_lm_head = parallel_lm_head
 
-def _apply_tp_Transformer(Transformer: Transformer) -> None:
+        def forward(self, input, use_flash=False, is_prefill=False):
+            if use_flash:
+                if is_prefill:
+                    input = input[:, -1:]
+                    
+                if self.parallel_lm_head:
+                    idx, lse = parallel_gumbel_multinomial_triton(input, self.weight.transpose(0, 1), output_lse=True)
+                    
+                    world_size = _get_world_size()
+                    rank = _get_rank()
+
+                    idx_list = None
+                    if rank == tgt:
+                        idx_list = [torch.empty_like(idx) for _ in range(world_size)]
+                        
+                    lse_list = None
+                    if rank == tgt:
+                        lse_list = [torch.empty_like(lse) for _ in range(world_size)]
+                        
+                    dist.gather(idx, idx_list, dst=tgt)
+                    dist.gather(lse, lse_list, dst=tgt)
+                    
+                    if rank == tgt:
+                        # print(idx.shape, lse.shape)
+                        # b k -> b k m
+                        idx = torch.stack(idx_list, dim=-1)
+                        # b 1 -> b m
+                        lse = torch.cat(lse_list, dim=-1)
+                        
+                        # print(idx.shape, lse.shape)
+                        
+                        idx_next = gumbel_multinomial_reduce_triton(idx, lse)
+                        
+                        # print("aaa", idx.shape, idx_next.shape)
+                    else:
+                        idx_next = idx
+                else:
+                    if is_prefill:
+                        input = input[:, -1:]
+                    idx_next, lse = parallel_gumbel_multinomial_triton(input, self.weight.transpose(0, 1))
+                    
+                return idx_next
+            else:
+                output = F.linear(input, self.weight)
+                
+                if self.parallel_lm_head: # if parallel over vocab, do gather
+                    world_size = _get_world_size()
+                    rank = _get_rank()
+                    
+                    output_list = None
+                    if rank == tgt:
+                        output_list = [torch.empty_like(output) for _ in range(world_size)]
+                    dist.gather(output, output_list, dst=tgt)
+                    torch.cuda.synchronize()
+
+                    if rank == tgt:
+                        output = torch.cat(output_list, dim=-1)
+                    
+                    # output_list = [torch.empty_like(output) for _ in range(world_size)]
+                    # dist.all_gather(output_list, output)
+                    # output = torch.cat(output_list, dim=-1)
+
+                return output
+
+        def extra_repr(self) -> str:
+            return f'in_features={self.in_features}, out_features={self.out_features}'
+            
+    out_col_parallel = ColumnParallelLinear(out.weight)
+    
+    return out_col_parallel
+
+def _apply_tp_Transformer(Transformer: Transformer, parallel_lm_head=False) -> None:
     # overwrite config before Transformer.setup_cache is called
     world_size = _get_world_size()
     Transformer.config.n_head = Transformer.config.n_head // world_size
     Transformer.config.dim = Transformer.config.dim // world_size
     Transformer.config.n_local_heads = Transformer.config.n_local_heads // world_size
+    Transformer.output = _apply_tp_lm_head(Transformer.output, parallel_lm_head)
+    Transformer.use_tp = True
 
-
-def apply_tp(model: Transformer) -> None:
-    _apply_tp_Transformer(model)
+def apply_tp(model: Transformer, parallel_lm_head=False) -> None:
+    print(model)
+    _apply_tp_Transformer(model, parallel_lm_head)
     for block in model.layers:
         # Apply to MLP
         _apply_tp_ffn(block.feed_forward)
         _apply_tp_attn(block.attention)
+        
+    print(model)
